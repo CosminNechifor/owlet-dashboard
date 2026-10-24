@@ -13,6 +13,11 @@ from app.oxygen_challenges import challenge_analysis, parse_time, reading_in_any
 from app.quality import is_offline_reading
 
 
+# Readings backfilled from Owlet's history services carry this raw_json "source"
+# tag, so they can be refreshed or removed without ever touching live rows.
+HISTORY_SOURCE = "owlet_history_backfill"
+
+
 # Per-reading raw storage keeps only what changes and what downstream code
 # reads back: the REAL_TIME_VITALS value string (the actual sensor payload),
 # the alert flags/mask (notification re-derivation + json_extract queries),
@@ -786,6 +791,100 @@ class ReadingStore:
             cursor = await db.execute(f"SELECT MAX(recorded_at) FROM readings {where}", params)
             row = await cursor.fetchone()
             return row[0] if row and row[0] else None
+
+    async def live_reading_epochs(
+        self, account_id: int, device_serial: str, start: datetime, end: datetime
+    ) -> list[int]:
+        """Epoch seconds of the live (non-backfilled) readings in [start, end]."""
+        await self.init()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT recorded_at FROM readings
+                WHERE account_id = ? AND device_serial = ? AND recorded_at >= ? AND recorded_at <= ?
+                  AND json_extract(raw_json, '$.source') IS NOT ?
+                """,
+                (account_id, device_serial, start.isoformat(), end.isoformat(), HISTORY_SOURCE),
+            )
+            rows = await cursor.fetchall()
+        return [int(datetime.fromisoformat(row[0]).timestamp()) for row in rows]
+
+    async def upsert_history_minutes(self, account_id: int, device_serial: str, minutes) -> int:
+        """Store backfilled minutes (app.owlet_history.HistoryMinute); returns rows written.
+
+        A re-run refreshes earlier backfilled minutes in place, but the WHERE on the
+        upsert means a live reading at the same timestamp is never overwritten.
+        """
+        await self.init()
+        if not minutes:
+            return 0
+        async with self._connect() as db:
+            cursor = await db.executemany(
+                """
+                INSERT INTO readings (
+                    account_id, device_serial, recorded_at, heart_rate, oxygen_saturation,
+                    movement, sleep_state, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, device_serial, recorded_at) DO UPDATE SET
+                    heart_rate=excluded.heart_rate,
+                    oxygen_saturation=excluded.oxygen_saturation,
+                    movement=excluded.movement,
+                    sleep_state=excluded.sleep_state,
+                    raw_json=excluded.raw_json
+                WHERE json_extract(readings.raw_json, '$.source') IS ?
+                """,
+                [
+                    (
+                        account_id,
+                        device_serial,
+                        minute.recorded_at.isoformat(),
+                        minute.heart_rate,
+                        minute.oxygen_saturation,
+                        minute.movement,
+                        minute.sleep_state,
+                        json.dumps(minute.raw),
+                        HISTORY_SOURCE,
+                    )
+                    for minute in minutes
+                ],
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def has_history_minutes(self, account_id: int) -> bool:
+        await self.init()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM readings WHERE account_id = ? AND json_extract(raw_json, '$.source') IS ? LIMIT 1",
+                (account_id, HISTORY_SOURCE),
+            )
+            return await cursor.fetchone() is not None
+
+    async def delete_history_minutes(self, account_id: int | None = None) -> int:
+        await self.init()
+        where = "json_extract(raw_json, '$.source') IS ?"
+        params: list[Any] = [HISTORY_SOURCE]
+        if account_id is not None:
+            where += " AND account_id = ?"
+            params.append(account_id)
+        async with self._connect() as db:
+            cursor = await db.execute(f"DELETE FROM readings WHERE {where}", params)
+            await db.commit()
+            return cursor.rowcount
+
+    async def latest_live_device_serial(self, account_id: int) -> str | None:
+        await self.init()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT device_serial FROM readings
+                WHERE account_id = ? AND json_extract(raw_json, '$.source') IS NOT ?
+                ORDER BY recorded_at DESC LIMIT 1
+                """,
+                (account_id, HISTORY_SOURCE),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
     async def get_readings(
         self,
