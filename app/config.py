@@ -27,7 +27,9 @@ class Settings(BaseSettings):
     # averages: the first run reaches back this many days, then daily runs refresh a week.
     history_backfill: bool = Field(default=True, alias="HISTORY_BACKFILL")
     history_backfill_days: int = Field(default=90, alias="HISTORY_BACKFILL_DAYS")
-    history_backfill_interval_hours: float = Field(default=24, alias="HISTORY_BACKFILL_INTERVAL_HOURS")
+    history_backfill_interval_hours: float = Field(
+        default=24, alias="HISTORY_BACKFILL_INTERVAL_HOURS"
+    )
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
@@ -47,3 +49,7 @@ class Settings(BaseSettings):
     def history_days(self) -> int:
         """Days the first history backfill reaches back; 0 when backfill is off."""
         return self.history_backfill_days if self.history_backfill else 0
+
+    @property
+    def history_interval_seconds(self) -> float:
+        return self.history_backfill_interval_hours * 3600

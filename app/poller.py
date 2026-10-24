@@ -105,7 +105,9 @@ class Poller:
         if self.history is not None and (self._history_task is None or self._history_task.done()):
             # Its own task: a backfill takes a minute of paced requests and must not
             # delay live polling.
-            self._history_task = asyncio.create_task(self._run_history(), name="owlet-history-backfill")
+            self._history_task = asyncio.create_task(
+                self._run_history(), name="owlet-history-backfill"
+            )
 
     async def stop(self, *, drain_timeout: float = 4.0) -> None:
         """Stop collecting. Bounded so it can't hang a request: if the poll loop

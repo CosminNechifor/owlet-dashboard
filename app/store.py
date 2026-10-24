@@ -801,7 +801,8 @@ class ReadingStore:
             cursor = await db.execute(
                 """
                 SELECT recorded_at FROM readings
-                WHERE account_id = ? AND device_serial = ? AND recorded_at >= ? AND recorded_at <= ?
+                WHERE account_id = ? AND device_serial = ?
+                  AND recorded_at >= ? AND recorded_at <= ?
                   AND json_extract(raw_json, '$.source') IS NOT ?
                 """,
                 (account_id, device_serial, start.isoformat(), end.isoformat(), HISTORY_SOURCE),
@@ -855,7 +856,10 @@ class ReadingStore:
         await self.init()
         async with self._connect() as db:
             cursor = await db.execute(
-                "SELECT 1 FROM readings WHERE account_id = ? AND json_extract(raw_json, '$.source') IS ? LIMIT 1",
+                """
+                SELECT 1 FROM readings
+                WHERE account_id = ? AND json_extract(raw_json, '$.source') IS ? LIMIT 1
+                """,
                 (account_id, HISTORY_SOURCE),
             )
             return await cursor.fetchone() is not None

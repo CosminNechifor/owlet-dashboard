@@ -34,7 +34,13 @@ from app.store import HISTORY_SOURCE, ReadingStore
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["HISTORY_SOURCE", "HistoryBackfill", "HistoryMinute", "OwletHistoryClient", "backfill_account"]
+__all__ = [
+    "HISTORY_SOURCE",
+    "HistoryBackfill",
+    "HistoryMinute",
+    "OwletHistoryClient",
+    "backfill_account",
+]
 
 LIVE_GAP_SECONDS = 90  # same gap at which the charts break the line; live data always wins
 DEVICE_VERSION = "smartSock4"  # what the Owlet app sends for a Dream Sock; "SS3" is rejected
@@ -112,19 +118,25 @@ def _windows(payload: Any) -> Iterable[dict[str, Any]]:
         }
 
 
-def history_minutes(vitals_payloads: Iterable[Any], sleep_payloads: Iterable[Any]) -> list[HistoryMinute]:
+def history_minutes(
+    vitals_payloads: Iterable[Any], sleep_payloads: Iterable[Any]
+) -> list[HistoryMinute]:
     """Expand 10-minute windows into one reading per minute, sorted and unique.
 
     Each minute carries its window's averages and that minute's sleep state. Windows
     returned by overlapping requests are merged, and because Owlet's windows are ~602 s
     apart (not 600), a boundary minute is given only to the earlier window.
     """
-    windows = {window["start"]: window for payload in vitals_payloads for window in _windows(payload)}
+    windows = {
+        window["start"]: window for payload in vitals_payloads for window in _windows(payload)
+    }
     sleep_by_minute: dict[int, Any] = {}
     for payload in sleep_payloads:
         data = _data(payload)
         # strict=False: if Owlet ever sends unequal arrays, keep the pairs that line up
-        for t, code in zip(data.get("timeWindowStartTimes") or [], data.get("sleepStates") or [], strict=False):
+        for t, code in zip(
+            data.get("timeWindowStartTimes") or [], data.get("sleepStates") or [], strict=False
+        ):
             sleep_by_minute[int(t) - int(t) % 60] = code
 
     minutes: list[HistoryMinute] = []
@@ -186,14 +198,23 @@ class OwletHistoryClient:
         query = urllib.parse.urlencode(
             {"resolution": 600, "startTime": start, "endTime": end, "version": DEVICE_VERSION}
         )
-        return await self._get(f"https://vital-data{self._suffix}.owletdata.com{await self._profile()}/vitals?{query}")
+        return await self._get(
+            f"https://vital-data{self._suffix}.owletdata.com{await self._profile()}/vitals?{query}"
+        )
 
     async def sleep(self, start: int, end: int) -> Any:
         query = urllib.parse.urlencode(
-            {"startTime": start, "endTime": end, "timeZone": self._timezone,
-             "returnBodyPositions": "True", "version": DEVICE_VERSION}
+            {
+                "startTime": start,
+                "endTime": end,
+                "timeZone": self._timezone,
+                "returnBodyPositions": "True",
+                "version": DEVICE_VERSION,
+            }
         )
-        return await self._get(f"https://sleep-data{self._suffix}.owletdata.com{await self._profile()}/sleep?{query}")
+        return await self._get(
+            f"https://sleep-data{self._suffix}.owletdata.com{await self._profile()}/sleep?{query}"
+        )
 
     async def close(self) -> None:
         if self._session is not None:
@@ -215,7 +236,9 @@ class OwletHistoryClient:
     async def _profile(self) -> str:
         if self._profile_path is None:
             account_id = await self._sign_in()
-            payload = await self._get(f"https://accounts{self._suffix}.owletdata.com/v2/accounts/{account_id}/profiles")
+            payload = await self._get(
+                f"https://accounts{self._suffix}.owletdata.com/v2/accounts/{account_id}/profiles"
+            )
             profiles = (payload or {}).get("profiles") or []
             if not profiles:
                 raise OwletHistoryError("no baby profile on this Owlet account")
@@ -227,7 +250,12 @@ class OwletHistoryClient:
         return await self._fetch("GET", url, {"Authorization": f"Bearer {self._id_token}"}, None)
 
     async def _http_fetch(
-        self, method: str, url: str, headers: dict[str, str], form: dict[str, str] | None, attempts: int = 4
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        form: dict[str, str] | None,
+        attempts: int = 4,
     ) -> Any:
         """JSON over aiohttp, waiting out rate limits (429) and retrying 5xx."""
         if self._session is None:
@@ -239,7 +267,9 @@ class OwletHistoryClient:
                     return await response.json(content_type=None)
                 if (response.status != 429 and response.status < 500) or attempt == attempts:
                     raise OwletHistoryError(f"{host} answered HTTP {response.status}")
-                reset = response.headers.get("x-ratelimit-reset") or response.headers.get("Retry-After")
+                reset = response.headers.get("x-ratelimit-reset") or response.headers.get(
+                    "Retry-After"
+                )
                 wait = int(reset) + 1 if reset and reset.isdigit() else 5 * attempt
             await asyncio.sleep(wait)
         raise OwletHistoryError(f"{host} kept failing")  # unreachable; keeps type checkers calm
@@ -276,7 +306,9 @@ async def backfill_account(
     live = await store.live_reading_epochs(
         account_id, device_serial, minutes[0].recorded_at - margin, minutes[-1].recorded_at + margin
     )
-    return await store.upsert_history_minutes(account_id, device_serial, without_live(minutes, live))
+    return await store.upsert_history_minutes(
+        account_id, device_serial, without_live(minutes, live)
+    )
 
 
 class HistoryBackfill:
@@ -318,7 +350,9 @@ class HistoryBackfill:
             )
         finally:
             await client.close()
-        logger.info("history backfill account_id=%s days=%s minutes=%s", self.account_id, days, written)
+        logger.info(
+            "history backfill account_id=%s days=%s minutes=%s", self.account_id, days, written
+        )
         return written
 
 
@@ -327,8 +361,12 @@ async def main(argv: list[str] | None = None) -> int:
         prog="python -m app.owlet_history",
         description="Backfill gaps from Owlet's history services (10-minute averages).",
     )
-    parser.add_argument("--days", type=int, help="how many days back (default: HISTORY_BACKFILL_DAYS)")
-    parser.add_argument("--remove", action="store_true", help="delete all backfilled history, then exit")
+    parser.add_argument(
+        "--days", type=int, help="how many days back (default: HISTORY_BACKFILL_DAYS)"
+    )
+    parser.add_argument(
+        "--remove", action="store_true", help="delete all backfilled history, then exit"
+    )
     args = parser.parse_args(argv)
     settings = Settings()
     store = ReadingStore(settings.database_path)
@@ -344,7 +382,9 @@ async def main(argv: list[str] | None = None) -> int:
         if not serial:
             print(f"account {account_id}: no live readings yet, skipped")
             continue
-        client = OwletHistoryClient(str(account.get("region") or "world"), str(account["refresh_token"]))
+        client = OwletHistoryClient(
+            str(account.get("region") or "world"), str(account["refresh_token"])
+        )
         try:
             written = await backfill_account(store, account_id, serial, client, days=days)
         finally:

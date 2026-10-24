@@ -35,8 +35,15 @@ def vitals_payload(*windows):
 
 def sleep_payload(*states):
     """states: (epoch, code) tuples, one per minute."""
-    return {"data": {"timeWindowStartTimes": [s[0] for s in states], "sleepStates": [s[1] for s in states],
-                     "bodyPositions": [], "positionTimes": []}, "sessions": []}
+    return {
+        "data": {
+            "timeWindowStartTimes": [s[0] for s in states],
+            "sleepStates": [s[1] for s in states],
+            "bodyPositions": [],
+            "positionTimes": [],
+        },
+        "sessions": [],
+    }
 
 
 ONE_WINDOW = vitals_payload((T0, T0 + 5, T0 + 595, 121.4375))
@@ -108,7 +115,11 @@ class FakeOwlet:
     async def __call__(self, method, url, headers, form=None):
         self.calls.append((method, url, headers, form))
         if "securetoken.googleapis.com" in url:
-            return {"id_token": "id-token", "user_id": "acct1", "refresh_token": form["refreshToken"]}
+            return {
+                "id_token": "id-token",
+                "user_id": "acct1",
+                "refresh_token": form["refreshToken"],
+            }
         if url.endswith("/profiles"):
             return {"profiles": [{"name": "accounts/acct1/profiles/prof1"}]}
         if "/vitals?" in url:
@@ -132,10 +143,16 @@ async def test_client_signs_in_with_the_refresh_token_and_reads_eu_history_servi
     assert token_call[3] == {"grantType": "refresh_token", "refreshToken": "refresh-1"}
     assert fake.urls("https://accounts.eu.owletdata.com/v2/accounts/acct1/profiles")
     (vitals_url,) = fake.urls("/vitals?")
-    assert vitals_url.startswith("https://vital-data.eu.owletdata.com/v1/accounts/acct1/profiles/prof1/vitals?")
+    assert vitals_url.startswith(
+        "https://vital-data.eu.owletdata.com/v1/accounts/acct1/profiles/prof1/vitals?"
+    )
     assert "resolution=600" in vitals_url and "version=smartSock4" in vitals_url
     assert fake.urls("https://sleep-data.eu.owletdata.com/v1/accounts/acct1/profiles/prof1/sleep?")
-    assert all(c[2].get("Authorization") == "Bearer id-token" for c in fake.calls if "owletdata.com" in c[1])
+    assert all(
+        c[2].get("Authorization") == "Bearer id-token"
+        for c in fake.calls
+        if "owletdata.com" in c[1]
+    )
 
 
 @pytest.mark.asyncio
@@ -155,8 +172,12 @@ async def test_client_uses_world_hosts_for_world_accounts_and_signs_in_once():
 async def seeded_store(tmp_path, *, live_at=None):
     store = ReadingStore(tmp_path / "owlet.sqlite3")
     await store.init()
-    account = await store.create_account(email="parent@example.test", region="europe", refresh_token="refresh-1")
-    live = normalize_reading({"hr": 130, "ox": 96, "data_updated_at": iso(live_at or T0 + 30 * DAY)}, "DSN1")
+    account = await store.create_account(
+        email="parent@example.test", region="europe", refresh_token="refresh-1"
+    )
+    live = normalize_reading(
+        {"hr": 130, "ox": 96, "data_updated_at": iso(live_at or T0 + 30 * DAY)}, "DSN1"
+    )
     await store.insert_reading(live, account_id=account["id"])
     return store, int(account["id"])
 
@@ -176,8 +197,9 @@ async def no_pause():
 async def test_backfill_adds_history_minutes_for_the_sock(tmp_path):
     store, account_id = await seeded_store(tmp_path)
     client = oh.OwletHistoryClient("europe", "refresh-1", fetch=FakeOwlet())
-    added = await oh.backfill_account(store, account_id, "DSN1", client, days=7,
-                                      end=T0 + DAY, pause=no_pause)
+    added = await oh.backfill_account(
+        store, account_id, "DSN1", client, days=7, end=T0 + DAY, pause=no_pause
+    )
     history = [r for r in rows(store) if r[2] == oh.HISTORY_SOURCE]
     assert added == len(history) == 10
     assert await store.has_history_minutes(account_id)
@@ -187,7 +209,9 @@ async def test_backfill_adds_history_minutes_for_the_sock(tmp_path):
 async def test_backfill_never_overwrites_or_crowds_live_readings(tmp_path):
     store, account_id = await seeded_store(tmp_path, live_at=T0 + 300)
     client = oh.OwletHistoryClient("europe", "refresh-1", fetch=FakeOwlet())
-    await oh.backfill_account(store, account_id, "DSN1", client, days=7, end=T0 + DAY, pause=no_pause)
+    await oh.backfill_account(
+        store, account_id, "DSN1", client, days=7, end=T0 + DAY, pause=no_pause
+    )
     all_rows = rows(store)
     assert (iso(T0 + 300), 130.0, None) in all_rows  # live row untouched
     assert len([r for r in all_rows if r[2] == oh.HISTORY_SOURCE]) == 7
@@ -196,12 +220,20 @@ async def test_backfill_never_overwrites_or_crowds_live_readings(tmp_path):
 @pytest.mark.asyncio
 async def test_rerunning_refreshes_values_and_keeps_older_history(tmp_path):
     store, account_id = await seeded_store(tmp_path)
-    older = OwletHistoryClientFor(vitals_payload((T0 - 7 * DAY, T0 - 7 * DAY + 5, T0 - 7 * DAY + 595, 110.0)))
-    await oh.backfill_account(store, account_id, "DSN1", older, days=14, end=T0 + DAY, pause=no_pause)
+    older = OwletHistoryClientFor(
+        vitals_payload((T0 - 7 * DAY, T0 - 7 * DAY + 5, T0 - 7 * DAY + 595, 110.0))
+    )
+    await oh.backfill_account(
+        store, account_id, "DSN1", older, days=14, end=T0 + DAY, pause=no_pause
+    )
     revised = OwletHistoryClientFor(vitals_payload((T0, T0 + 5, T0 + 595, 125.0)))
-    await oh.backfill_account(store, account_id, "DSN1", revised, days=7, end=T0 + DAY, pause=no_pause)
+    await oh.backfill_account(
+        store, account_id, "DSN1", revised, days=7, end=T0 + DAY, pause=no_pause
+    )
     revised_again = OwletHistoryClientFor(vitals_payload((T0, T0 + 5, T0 + 595, 126.0)))
-    await oh.backfill_account(store, account_id, "DSN1", revised_again, days=7, end=T0 + DAY, pause=no_pause)
+    await oh.backfill_account(
+        store, account_id, "DSN1", revised_again, days=7, end=T0 + DAY, pause=no_pause
+    )
 
     history = [r for r in rows(store) if r[2] == oh.HISTORY_SOURCE]
     assert len(history) == 20  # the older night survives the shorter re-run
@@ -215,8 +247,15 @@ def OwletHistoryClientFor(vitals):
 @pytest.mark.asyncio
 async def test_deleting_history_leaves_live_readings(tmp_path):
     store, account_id = await seeded_store(tmp_path)
-    await oh.backfill_account(store, account_id, "DSN1", OwletHistoryClientFor(ONE_WINDOW), days=7,
-                              end=T0 + DAY, pause=no_pause)
+    await oh.backfill_account(
+        store,
+        account_id,
+        "DSN1",
+        OwletHistoryClientFor(ONE_WINDOW),
+        days=7,
+        end=T0 + DAY,
+        pause=no_pause,
+    )
     assert await store.delete_history_minutes() == 10
     assert [r[2] for r in rows(store)] == [None]
     assert not await store.has_history_minutes(account_id)
@@ -249,13 +288,22 @@ class RecordingClient:
 async def test_first_run_reaches_far_back_and_later_runs_only_refresh_recent_days(tmp_path):
     store, account_id = await seeded_store(tmp_path)
     RecordingClient.instances = []
-    job = oh.HistoryBackfill(store, account_id, "europe", refresh_token=lambda: "refresh-1",
-                             device_serial=lambda: "DSN1", initial_days=90, recent_days=7,
-                             client_factory=RecordingClient, pause=no_pause)
+    job = oh.HistoryBackfill(
+        store,
+        account_id,
+        "europe",
+        refresh_token=lambda: "refresh-1",
+        device_serial=lambda: "DSN1",
+        initial_days=90,
+        recent_days=7,
+        client_factory=RecordingClient,
+        pause=no_pause,
+    )
     assert await job.run_once() == 10
     await job.run_once()
     first, later = RecordingClient.instances
-    assert (first.vitals_calls, later.vitals_calls) == (13, 1)  # 90 days vs 7 days in weekly requests
+    # 90 days vs 7 days, in weekly requests
+    assert (first.vitals_calls, later.vitals_calls) == (13, 1)
     assert first.region == "europe" and first.refresh_token == "refresh-1"
 
 
@@ -263,8 +311,15 @@ async def test_first_run_reaches_far_back_and_later_runs_only_refresh_recent_day
 async def test_job_waits_until_it_has_a_login_and_a_sock(tmp_path):
     store, account_id = await seeded_store(tmp_path)
     RecordingClient.instances = []
-    job = oh.HistoryBackfill(store, account_id, "europe", refresh_token=lambda: None,
-                             device_serial=lambda: "DSN1", client_factory=RecordingClient, pause=no_pause)
+    job = oh.HistoryBackfill(
+        store,
+        account_id,
+        "europe",
+        refresh_token=lambda: None,
+        device_serial=lambda: "DSN1",
+        client_factory=RecordingClient,
+        pause=no_pause,
+    )
     assert await job.run_once() == 0
     assert RecordingClient.instances == []
 
@@ -283,8 +338,15 @@ async def test_poller_runs_the_history_job_alongside_polling_and_stops_it(tmp_pa
     async def read_once():
         return normalize_reading({"hr": 120, "ox": 97}, "DSN1")
 
-    poller = Poller(store, read_once, interval_seconds=3600, account_id=account_id,
-                    history=CountingJob(), history_interval_seconds=0.01, history_initial_delay_seconds=0)
+    poller = Poller(
+        store,
+        read_once,
+        interval_seconds=3600,
+        account_id=account_id,
+        history=CountingJob(),
+        history_interval_seconds=0.01,
+        history_initial_delay_seconds=0,
+    )
     poller.start()
     for _ in range(100):
         if CountingJob.runs >= 2:
@@ -306,8 +368,15 @@ def test_history_backfill_setting_can_be_turned_off():
 @pytest.mark.asyncio
 async def test_command_line_remove_deletes_only_backfilled_history(tmp_path, monkeypatch, capsys):
     store, account_id = await seeded_store(tmp_path)
-    await oh.backfill_account(store, account_id, "DSN1", OwletHistoryClientFor(ONE_WINDOW), days=7,
-                              end=T0 + DAY, pause=no_pause)
+    await oh.backfill_account(
+        store,
+        account_id,
+        "DSN1",
+        OwletHistoryClientFor(ONE_WINDOW),
+        days=7,
+        end=T0 + DAY,
+        pause=no_pause,
+    )
     monkeypatch.setenv("DATABASE_PATH", str(store.db_path))
     assert await oh.main(["--remove"]) == 0
     assert "Removed 10" in capsys.readouterr().out

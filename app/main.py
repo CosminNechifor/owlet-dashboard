@@ -158,7 +158,7 @@ def create_app(
                             ),
                             password=account.get("owlet_password"),
                             history_days=settings.history_days,
-                            history_interval_seconds=settings.history_backfill_interval_hours * 3600,
+                            history_interval_seconds=settings.history_interval_seconds,
                         )
                         poller.start()
                         pollers.append(poller)
@@ -188,7 +188,7 @@ def create_app(
                         interval_seconds=settings.poll_interval_seconds,
                         account_id=default_account_id,
                         history_days=settings.history_days,
-                        history_interval_seconds=settings.history_backfill_interval_hours * 3600,
+                        history_interval_seconds=settings.history_interval_seconds,
                     )
                     poller.start()
                     pollers.append(poller)
@@ -518,7 +518,7 @@ def create_app(
                     history=history_for_client(
                         store, account_id, region, client_for_poller, settings.history_days
                     ),
-                    history_interval_seconds=settings.history_backfill_interval_hours * 3600,
+                    history_interval_seconds=settings.history_interval_seconds,
                 )
                 poller.start()
                 live.append(poller)
