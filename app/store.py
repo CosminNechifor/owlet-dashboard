@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,7 @@ from app.oxygen_challenges import challenge_analysis, parse_time, reading_in_any
 from app.quality import is_offline_reading
 
 
-# Readings backfilled from Owlet's history services carry this raw_json "source"
-# tag, so they can be refreshed or removed without ever touching live rows.
+# raw_json "source" tag on readings backfilled from Owlet's history services.
 HISTORY_SOURCE = "owlet_history_backfill"
 
 
@@ -792,30 +792,34 @@ class ReadingStore:
             row = await cursor.fetchone()
             return row[0] if row and row[0] else None
 
-    async def live_reading_epochs(
+    async def live_reading_minutes(
         self, account_id: int, device_serial: str, start: datetime, end: datetime
     ) -> list[int]:
-        """Epoch seconds of the live (non-backfilled) readings in [start, end]."""
+        """Minute-aligned epochs (ascending) of the minutes holding a live reading in
+        [start, end]. Bucketed in SQL so a 5 s collector returns one row per minute."""
         await self.init()
         async with self._connect() as db:
             cursor = await db.execute(
                 """
-                SELECT recorded_at FROM readings
+                SELECT DISTINCT substr(recorded_at, 1, 16) AS minute FROM readings
                 WHERE account_id = ? AND device_serial = ?
                   AND recorded_at >= ? AND recorded_at <= ?
                   AND json_extract(raw_json, '$.source') IS NOT ?
+                ORDER BY minute
                 """,
                 (account_id, device_serial, start.isoformat(), end.isoformat(), HISTORY_SOURCE),
             )
             rows = await cursor.fetchall()
-        return [int(datetime.fromisoformat(row[0]).timestamp()) for row in rows]
+        # recorded_at is ISO UTC; its first 16 characters are the minute
+        return [
+            int(datetime.fromisoformat(row[0] + ":00+00:00").timestamp()) for row in rows
+        ]
 
-    async def upsert_history_minutes(self, account_id: int, device_serial: str, minutes) -> int:
-        """Store backfilled minutes (app.owlet_history.HistoryMinute); returns rows written.
-
-        A re-run refreshes earlier backfilled minutes in place, but the WHERE on the
-        upsert means a live reading at the same timestamp is never overwritten.
-        """
+    async def upsert_history_minutes(
+        self, account_id: int, device_serial: str, minutes: Iterable[Any]
+    ) -> int:
+        """Upsert backfilled minutes (app.owlet_history.HistoryMinute); returns rows written.
+        A live reading at the same timestamp is never overwritten."""
         await self.init()
         if not minutes:
             return 0
@@ -852,17 +856,19 @@ class ReadingStore:
             await db.commit()
             return cursor.rowcount
 
-    async def has_history_minutes(self, account_id: int) -> bool:
-        await self.init()
-        async with self._connect() as db:
-            cursor = await db.execute(
-                """
-                SELECT 1 FROM readings
-                WHERE account_id = ? AND json_extract(raw_json, '$.source') IS ? LIMIT 1
-                """,
-                (account_id, HISTORY_SOURCE),
-            )
-            return await cursor.fetchone() is not None
+    async def history_backfill_state(self, account_id: int) -> dict[str, Any] | None:
+        """When the account's history backfill last completed, or None if it never has.
+        Kept in dashboard_preferences, which the UI's patches merge into, never replace."""
+        account = await self.get_account(account_id)
+        state = (account.get("dashboard_preferences") or {}).get("history_backfill")
+        return state if isinstance(state, dict) else None
+
+    async def set_history_backfill_state(
+        self, account_id: int, state: dict[str, Any] | None
+    ) -> None:
+        await self.update_account_preferences(
+            account_id, dashboard_preferences={"history_backfill": state}
+        )
 
     async def delete_history_minutes(self, account_id: int | None = None) -> int:
         await self.init()

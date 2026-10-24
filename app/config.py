@@ -23,8 +23,7 @@ class Settings(BaseSettings):
     seed_default_admin: bool = Field(default=False, alias="SEED_DEFAULT_ADMIN")
     # Set by the desktop shell: surfaces the collects-only-while-running warning.
     desktop_mode: bool = Field(default=False, alias="OWLET_DESKTOP")
-    # Fill gaps (collector off, outages) from Owlet's history services, as 10-minute
-    # averages: the first run reaches back this many days, then daily runs refresh a week.
+    # Gap backfill from Owlet's history services; see app/owlet_history.py.
     history_backfill: bool = Field(default=True, alias="HISTORY_BACKFILL")
     history_backfill_days: int = Field(default=90, alias="HISTORY_BACKFILL_DAYS")
     history_backfill_interval_hours: float = Field(
@@ -47,7 +46,6 @@ class Settings(BaseSettings):
 
     @property
     def history_days(self) -> int:
-        """Days the first history backfill reaches back; 0 when backfill is off."""
         return self.history_backfill_days if self.history_backfill else 0
 
     @property

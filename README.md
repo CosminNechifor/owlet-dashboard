@@ -78,10 +78,12 @@ Each collector now pulls those about a minute after it starts, then once a day:
   that minute's sleep state, so the charts draw continuous (stepped) lines rather than dots.
   The window's min/max and sample count go in `raw_json`.
 - Backfilled rows are tagged `raw_json.source = "owlet_history_backfill"`. They never replace
-  a live reading, and minutes within 90 s of live data are skipped, so full-detail data always
-  wins. Re-runs update earlier backfilled minutes in place and never delete older nights.
+  a live reading, and minutes with live data in the same or an adjacent minute are skipped, so
+  full-detail data always wins. Re-runs update earlier backfilled minutes in place and never
+  delete older nights.
 - Sign-in reuses the stored Firebase refresh token: no password, and the live Ayla session is
   untouched, so it does not count as a second collector.
+- A run that fails (Owlet outage, rate limit) is retried within the hour, not the next day.
 
 | Setting | Default | |
 | --- | --- | --- |
@@ -92,13 +94,17 @@ Each collector now pulls those about a minute after it starts, then once a day:
 Run it by hand, or undo it:
 
 ```bash
-python -m app.owlet_history             # backfill every linked sock now
+python -m app.owlet_history                 # backfill every linked sock now
 python -m app.owlet_history --days 30
-python -m app.owlet_history --remove    # delete all backfilled rows; live readings stay
+python -m app.owlet_history --remove        # delete backfilled rows; live readings stay
+python -m app.owlet_history --account 2 --remove
+# in Docker (run as the app's user, so the database files stay writable by it):
+docker exec -u 1000 owlet-dashboard python -m app.owlet_history
 ```
 
 Caveats: these are undocumented Owlet services, so they can change. They hold averages only,
-so brief SpO₂ dips inside a 10-minute window aren't visible in backfilled time. It was
+so brief SpO₂ dips inside a 10-minute window aren't visible in backfilled time, and averaged
+movement rarely crosses the awake threshold, so movement-based figures run low there. It was
 verified with an EU Dream Sock (the requests send `version=smartSock4`); older socks may
 reject that, in which case the job logs the error and live collection carries on.
 

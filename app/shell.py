@@ -1259,7 +1259,7 @@ SHELL_JS = """<script>
     notice.className = 'desktop-notice';
     notice.innerHTML = '<b>Desktop app:</b> readings are collected only while this window is '
       + 'open and the PC is awake — a closed laptop or sleeping PC leaves gaps that are later '
-      + 'filled only with Owlet\'s 10-minute averages. If you already run the Docker server '
+      + 'filled only with 10-minute averages from Owlet. If you already run the Docker server '
       + 'version, use its web '
       + 'page instead of this app: two collectors on one Owlet login sign each other out '
       + 'and BOTH end up with gaps. '

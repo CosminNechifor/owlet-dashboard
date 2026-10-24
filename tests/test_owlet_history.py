@@ -1,9 +1,13 @@
 import asyncio
+import contextlib
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from app import owlet_history as oh
 from app.config import Settings
@@ -53,9 +57,6 @@ def iso(epoch):
     return datetime.fromtimestamp(epoch, UTC).isoformat()
 
 
-# --- turning Owlet's 10-minute windows into minutes -------------------------------------------
-
-
 def test_chunk_ranges_splits_into_weekly_windows():
     assert oh.chunk_ranges(0, 20 * DAY) == [(0, 7 * DAY), (7 * DAY, 14 * DAY), (14 * DAY, 20 * DAY)]
     assert oh.chunk_ranges(5, 5) == []
@@ -95,21 +96,20 @@ def test_empty_or_missing_payloads_give_no_minutes():
     assert oh.history_minutes([{"data": None}, {}, None], [None]) == []
 
 
-def test_minutes_within_90s_of_a_live_reading_are_dropped():
-    kept = oh.without_live(oh.history_minutes([ONE_WINDOW], []), [T0 + 300])
+def test_minutes_with_live_data_in_the_same_or_an_adjacent_minute_are_dropped():
+    kept = oh.without_live(oh.history_minutes([ONE_WINDOW], []), live_minutes=[T0 + 300])
     times = [m.recorded_at.isoformat() for m in kept]
     assert len(times) == 7  # drops T0+240, T0+300, T0+360
     assert iso(T0 + 180) in times and iso(T0 + 300) not in times
-
-
-# --- talking to Owlet's history services --------------------------------------------------------
+    assert iso(T0 + 420) in times
 
 
 class FakeOwlet:
     """Stands in for Google's token service and Owlet's history services."""
 
-    def __init__(self, vitals=ONE_WINDOW, sleep=None):
+    def __init__(self, vitals=ONE_WINDOW, sleep=None, profiles=None):
         self.vitals, self.sleep = vitals, sleep or sleep_payload()
+        self.profiles = profiles or [{"name": "accounts/acct1/profiles/prof1"}]
         self.calls: list[tuple[str, str, dict, dict | None]] = []
 
     async def __call__(self, method, url, headers, form=None):
@@ -121,7 +121,7 @@ class FakeOwlet:
                 "refresh_token": form["refreshToken"],
             }
         if url.endswith("/profiles"):
-            return {"profiles": [{"name": "accounts/acct1/profiles/prof1"}]}
+            return {"profiles": self.profiles}
         if "/vitals?" in url:
             return self.vitals
         if "/sleep?" in url:
@@ -166,7 +166,96 @@ async def test_client_uses_world_hosts_for_world_accounts_and_signs_in_once():
     assert len(fake.urls("securetoken")) == 1 and len(profile_lookups) == 1
 
 
-# --- storing history next to live readings ------------------------------------------------------
+@pytest.mark.asyncio
+async def test_client_refuses_a_profile_listing_it_does_not_understand():
+    client = oh.OwletHistoryClient(
+        "europe", "refresh-1", fetch=FakeOwlet(profiles=[{"name": "something-else"}])
+    )
+    with pytest.raises(oh.OwletHistoryError):
+        await client.vitals(T0, T0 + DAY)
+
+
+@contextlib.asynccontextmanager
+async def owlet_stub(responses):
+    """A local HTTP server answering with the given (status, headers, body) in order."""
+    requests: list[str] = []
+
+    async def handler(request):
+        requests.append(request.method + " " + request.path)
+        status, headers, body = responses.pop(0)
+        return web.Response(status=status, headers=headers, text=json.dumps(body))
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        yield server, requests
+    finally:
+        await server.close()
+
+
+def client_with_recorded_sleeps():
+    waits: list[float] = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    return oh.OwletHistoryClient("europe", "refresh-1", sleep=fake_sleep), waits
+
+
+@pytest.mark.asyncio
+async def test_http_fetch_waits_out_a_rate_limit_then_succeeds():
+    client, waits = client_with_recorded_sleeps()
+    async with owlet_stub([(429, {"x-ratelimit-reset": "7"}, {}), (200, {}, {"ok": 1})]) as (
+        server,
+        requests,
+    ):
+        assert await client._http_fetch("GET", str(server.make_url("/v")), {}, None) == {"ok": 1}
+    await client.close()
+    assert len(requests) == 2 and waits == [8]
+
+
+@pytest.mark.asyncio
+async def test_http_fetch_caps_rate_limit_waits_and_reads_epoch_style_resets():
+    client, waits = client_with_recorded_sleeps()
+    soon = str(int(time.time()) + 30)
+    async with owlet_stub(
+        [
+            (429, {"x-ratelimit-reset": "99999"}, {}),
+            (429, {"x-ratelimit-reset": soon}, {}),
+            (200, {}, {}),
+        ]
+    ) as (server, _):
+        await client._http_fetch("GET", str(server.make_url("/v")), {}, None)
+    await client.close()
+    assert waits[0] == oh.MAX_RATE_LIMIT_WAIT_SECONDS
+    assert 25 <= waits[1] <= 35
+
+
+@pytest.mark.asyncio
+async def test_http_fetch_does_not_retry_client_errors_and_names_only_the_host():
+    client, waits = client_with_recorded_sleeps()
+    async with owlet_stub([(401, {}, {})]) as (server, requests):
+        with pytest.raises(oh.OwletHistoryError) as err:
+            await client._http_fetch(
+                "GET", str(server.make_url("/v1/accounts/secret-id")), {}, None
+            )
+    await client.close()
+    assert len(requests) == 1 and waits == []
+    assert "secret-id" not in str(err.value) and "401" in str(err.value)
+
+
+@pytest.mark.asyncio
+async def test_http_fetch_gives_up_after_repeated_server_errors_and_closes_its_session():
+    client, waits = client_with_recorded_sleeps()
+    async with owlet_stub([(503, {}, {})] * 4) as (server, requests):
+        with pytest.raises(oh.OwletHistoryError):
+            await client._http_fetch("GET", str(server.make_url("/v")), {}, None)
+    session = client._session
+    await client.close()
+    assert len(requests) == 4 and waits == [5, 10, 15]
+    assert session.closed
 
 
 async def seeded_store(tmp_path, *, live_at=None):
@@ -202,7 +291,38 @@ async def test_backfill_adds_history_minutes_for_the_sock(tmp_path):
     )
     history = [r for r in rows(store) if r[2] == oh.HISTORY_SOURCE]
     assert added == len(history) == 10
-    assert await store.has_history_minutes(account_id)
+
+
+@pytest.mark.asyncio
+async def test_store_upsert_leaves_a_live_reading_at_the_same_minute_untouched(tmp_path):
+    live_at = T0 + 30 * DAY
+    store, account_id = await seeded_store(tmp_path, live_at=live_at)
+    clash = oh.HistoryMinute(
+        datetime.fromtimestamp(live_at, UTC), 99.0, 99.0, 0.0, None, {"source": oh.HISTORY_SOURCE}
+    )
+    other = oh.HistoryMinute(
+        datetime.fromtimestamp(live_at + 60, UTC),
+        98.0,
+        98.0,
+        0.0,
+        None,
+        {"source": oh.HISTORY_SOURCE},
+    )
+    written = await store.upsert_history_minutes(account_id, "DSN1", [clash, other])
+    assert written == 1
+    assert (iso(live_at), 130.0, None) in rows(store)
+
+
+@pytest.mark.asyncio
+async def test_store_reports_live_minutes_as_distinct_minute_buckets(tmp_path):
+    store, account_id = await seeded_store(tmp_path, live_at=T0 + 5)
+    for offset in (10, 65):
+        reading = normalize_reading(
+            {"hr": 130, "ox": 96, "data_updated_at": iso(T0 + offset)}, "DSN1"
+        )
+        await store.insert_reading(reading, account_id=account_id)
+    start, end = datetime.fromtimestamp(T0 - 60, UTC), datetime.fromtimestamp(T0 + 600, UTC)
+    assert await store.live_reading_minutes(account_id, "DSN1", start, end) == [T0, T0 + 60]
 
 
 @pytest.mark.asyncio
@@ -213,7 +333,7 @@ async def test_backfill_never_overwrites_or_crowds_live_readings(tmp_path):
         store, account_id, "DSN1", client, days=7, end=T0 + DAY, pause=no_pause
     )
     all_rows = rows(store)
-    assert (iso(T0 + 300), 130.0, None) in all_rows  # live row untouched
+    assert (iso(T0 + 300), 130.0, None) in all_rows
     assert len([r for r in all_rows if r[2] == oh.HISTORY_SOURCE]) == 7
 
 
@@ -236,7 +356,7 @@ async def test_rerunning_refreshes_values_and_keeps_older_history(tmp_path):
     )
 
     history = [r for r in rows(store) if r[2] == oh.HISTORY_SOURCE]
-    assert len(history) == 20  # the older night survives the shorter re-run
+    assert len(history) == 20
     assert {r[1] for r in history if r[0] >= iso(T0)} == {126.0}
 
 
@@ -258,10 +378,6 @@ async def test_deleting_history_leaves_live_readings(tmp_path):
     )
     assert await store.delete_history_minutes() == 10
     assert [r[2] for r in rows(store)] == [None]
-    assert not await store.has_history_minutes(account_id)
-
-
-# --- the daily job ------------------------------------------------------------------------------
 
 
 class RecordingClient:
@@ -305,6 +421,57 @@ async def test_first_run_reaches_far_back_and_later_runs_only_refresh_recent_day
     # 90 days vs 7 days, in weekly requests
     assert (first.vitals_calls, later.vitals_calls) == (13, 1)
     assert first.region == "europe" and first.refresh_token == "refresh-1"
+    state = await store.history_backfill_state(account_id)
+    assert state["days"] == 7 and state["minutes"] == 10 and "completed_at" in state
+
+
+def recording_job(store, account_id, **overrides):
+    options = dict(
+        refresh_token=lambda: "refresh-1",
+        device_serial=lambda: "DSN1",
+        initial_days=90,
+        recent_days=7,
+        client_factory=RecordingClient,
+        pause=no_pause,
+    )
+    options.update(overrides)
+    return oh.HistoryBackfill(store, account_id, "europe", **options)
+
+
+@pytest.mark.asyncio
+async def test_a_first_run_that_finds_nothing_to_add_still_counts_as_done(tmp_path):
+    # live data for every minute Owlet will return, so nothing gets written
+    store, account_id = await seeded_store(tmp_path, live_at=T0)
+    for offset in range(60, 600, 60):
+        reading = normalize_reading(
+            {"hr": 130, "ox": 96, "data_updated_at": iso(T0 + offset)}, "DSN1"
+        )
+        await store.insert_reading(reading, account_id=account_id)
+    RecordingClient.instances = []
+    job = recording_job(store, account_id)
+    assert await job.run_once() == 0
+    assert await job.run_once() == 0
+    first, later = RecordingClient.instances
+    assert (first.vitals_calls, later.vitals_calls) == (13, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_run_is_repeated_in_full(tmp_path):
+    store, account_id = await seeded_store(tmp_path)
+    RecordingClient.instances = []
+
+    class FlakyClient(RecordingClient):
+        async def vitals(self, start, end):
+            if len(RecordingClient.instances) == 1:
+                raise oh.OwletHistoryError("vital-data answered HTTP 503")
+            return await super().vitals(start, end)
+
+    job = recording_job(store, account_id, client_factory=FlakyClient)
+    with pytest.raises(oh.OwletHistoryError):
+        await job.run_once()
+    assert await store.history_backfill_state(account_id) is None
+    assert await job.run_once() == 10
+    assert RecordingClient.instances[1].vitals_calls == 13
 
 
 @pytest.mark.asyncio
@@ -356,7 +523,43 @@ async def test_poller_runs_the_history_job_alongside_polling_and_stops_it(tmp_pa
     runs_at_stop = CountingJob.runs
     await asyncio.sleep(0.05)
     assert runs_at_stop >= 2
-    assert CountingJob.runs == runs_at_stop  # stopped with the poller
+    assert CountingJob.runs == runs_at_stop
+
+
+@pytest.mark.asyncio
+async def test_a_failed_history_run_is_retried_well_before_the_next_daily_run(tmp_path):
+    store, account_id = await seeded_store(tmp_path)
+
+    class FlakyJob:
+        runs = 0
+
+        async def run_once(self):
+            FlakyJob.runs += 1
+            if FlakyJob.runs == 1:
+                raise oh.OwletHistoryError("vital-data answered HTTP 503")
+            return 0
+
+    async def read_once():
+        return normalize_reading({"hr": 120, "ox": 97}, "DSN1")
+
+    poller = Poller(
+        store,
+        read_once,
+        interval_seconds=3600,
+        account_id=account_id,
+        history=FlakyJob(),
+        history_interval_seconds=3600,
+        history_retry_seconds=0.01,
+        history_initial_delay_seconds=0,
+    )
+    poller.start()
+    for _ in range(100):
+        if FlakyJob.runs >= 2:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    await poller.stop()
+    assert FlakyJob.runs == 2  # one retry, then back to the daily interval
 
 
 def test_history_backfill_setting_can_be_turned_off():
@@ -377,10 +580,34 @@ async def test_command_line_remove_deletes_only_backfilled_history(tmp_path, mon
         end=T0 + DAY,
         pause=no_pause,
     )
+    await store.set_history_backfill_state(
+        account_id, {"completed_at": iso(T0), "days": 90, "minutes": 10}
+    )
     monkeypatch.setenv("DATABASE_PATH", str(store.db_path))
     assert await oh.main(["--remove"]) == 0
     assert "Removed 10" in capsys.readouterr().out
     assert [r[2] for r in rows(store)] == [None]
+    assert await store.history_backfill_state(account_id) is None
+
+
+@pytest.mark.asyncio
+async def test_command_line_can_target_one_account(tmp_path, monkeypatch, capsys):
+    store, first = await seeded_store(tmp_path)
+    second = int((await store.create_account(email="other@example.test", refresh_token="r2"))["id"])
+    for account_id in (first, second):
+        await oh.backfill_account(
+            store,
+            account_id,
+            "DSN1",
+            OwletHistoryClientFor(ONE_WINDOW),
+            days=7,
+            end=T0 + DAY,
+            pause=no_pause,
+        )
+    monkeypatch.setenv("DATABASE_PATH", str(store.db_path))
+    assert await oh.main(["--remove", "--account", str(second)]) == 0
+    assert "Removed 10" in capsys.readouterr().out
+    assert len([r for r in rows(store) if r[2] == oh.HISTORY_SOURCE]) == 10
 
 
 @pytest.mark.asyncio

@@ -1,23 +1,22 @@
 """Fill collection gaps from Owlet's own history services.
 
-The live feed this app polls (Ayla device properties) only remembers the last few
-minutes, so time the collector was off used to be a permanent gap. The Owlet mobile
-app draws its History screen from separate services that keep 10-minute vital
-averages and minute-by-minute sleep states for weeks. This module pulls those, signed
-in with the same Firebase refresh token pyowletapi already stores (no password, and
-the live Ayla session is never touched), and stores them as one reading per minute:
-the charts break their lines at 90 s gaps, so one point per window would draw as
-scattered dots. Backfilled rows carry raw_json "source" = HISTORY_SOURCE and never
-replace or crowd live readings.
+The live feed this app polls (Ayla device properties) remembers only the last few
+minutes, so time the collector was off used to be a permanent gap. The Owlet app's
+History screen comes from separate services that keep 10-minute vital averages and
+minute-by-minute sleep states for weeks. This module pulls those, signed in with the
+Firebase refresh token pyowletapi already stores (no password, live Ayla session
+untouched), and stores them as one reading per minute because the charts break their
+lines at gaps over 90 s. Backfilled rows carry raw_json "source" = HISTORY_SOURCE and
+never replace or crowd live readings.
 
-Run by hand with ``python -m app.owlet_history`` (``--days N``, ``--remove``).
+Run by hand with ``python -m app.owlet_history`` (``--days N``, ``--remove``,
+``--account ID``).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import bisect
 import logging
 import time
 import urllib.parse
@@ -42,20 +41,21 @@ __all__ = [
     "backfill_account",
 ]
 
-LIVE_GAP_SECONDS = 90  # same gap at which the charts break the line; live data always wins
 DEVICE_VERSION = "smartSock4"  # what the Owlet app sends for a Dream Sock; "SS3" is rejected
-CHUNK_SECONDS = 7 * 86400  # one request per service per week of history
+CHUNK_SECONDS = 7 * 86400
 PAUSE_SECONDS = 2.5  # sleep-data allows ~25 requests/min, vital-data ~45/min
-RECENT_DAYS = 7  # once an account has history, daily runs only refresh the last week
+RECENT_DAYS = 7  # daily refresh window once the first run has completed
+MAX_RATE_LIMIT_WAIT_SECONDS = 120
+MINUTE = 60
 
-# pyowletapi signs in as the Android app, and its Firebase refresh token only works
-# with the same app identity.
+# pyowletapi signs in as the Android app; its refresh token only works with that identity.
 _ANDROID_HEADERS = {
     "X-Android-Package": "com.owletcare.owletcare",
     "X-Android-Cert": "2A3BC26DB0B8B0792DBE28E6FFDC2598F9B12B74",
 }
 
 Fetch = Callable[[str, str, dict[str, str], dict[str, str] | None], Awaitable[Any]]
+Sleep = Callable[[float], Awaitable[None]]
 
 
 class OwletHistoryError(RuntimeError):
@@ -93,7 +93,6 @@ def _round(value: float | None, digits: int) -> float | None:
 
 
 def _windows(payload: Any) -> Iterable[dict[str, Any]]:
-    """The 10-minute windows of one vital-data /vitals response."""
     data = _data(payload)
     heart, oxygen = data.get("heartRate") or {}, data.get("oxygen") or {}
     movement = data.get("movement") or {}
@@ -133,11 +132,10 @@ def history_minutes(
     sleep_by_minute: dict[int, Any] = {}
     for payload in sleep_payloads:
         data = _data(payload)
-        # strict=False: if Owlet ever sends unequal arrays, keep the pairs that line up
         for t, code in zip(
             data.get("timeWindowStartTimes") or [], data.get("sleepStates") or [], strict=False
         ):
-            sleep_by_minute[int(t) - int(t) % 60] = code
+            sleep_by_minute[int(t) - int(t) % MINUTE] = code
 
     minutes: list[HistoryMinute] = []
     next_free: int | None = None
@@ -145,11 +143,11 @@ def history_minutes(
         window = windows[start]
         first = int(window["first"] if window["first"] is not None else start)
         last = int(window["last"] if window["last"] is not None else start + 599)
-        first -= first % 60
+        first -= first % MINUTE
         if next_free is not None:
             first = max(first, next_free)
-        next_free = max(next_free or 0, last - last % 60 + 60)
-        for minute in range(first, last - last % 60 + 1, 60):
+        next_free = max(next_free or 0, last - last % MINUTE + MINUTE)
+        for minute in range(first, last - last % MINUTE + 1, MINUTE):
             code = sleep_by_minute.get(minute)
             minutes.append(
                 HistoryMinute(
@@ -164,24 +162,39 @@ def history_minutes(
     return minutes
 
 
-def without_live(
-    minutes: list[HistoryMinute], live_epochs: Iterable[int], tolerance: int = LIVE_GAP_SECONDS
-) -> list[HistoryMinute]:
-    """Drop minutes within `tolerance` seconds of a live reading."""
-    live = sorted(live_epochs)
+def without_live(minutes: list[HistoryMinute], live_minutes: Iterable[int]) -> list[HistoryMinute]:
+    """Drop minutes that have live data in the same or an adjacent minute."""
+    live = set(live_minutes)
+    return [
+        m
+        for m in minutes
+        if not any(
+            int(m.recorded_at.timestamp()) + offset in live for offset in (-MINUTE, 0, MINUTE)
+        )
+    ]
 
-    def near_live(t: int) -> bool:
-        i = bisect.bisect_left(live, t - tolerance)
-        return i < len(live) and live[i] <= t + tolerance
 
-    return [m for m in minutes if not near_live(int(m.recorded_at.timestamp()))]
+def _retry_wait(reset_header: str | None, attempt: int) -> int:
+    """Owlet sends x-ratelimit-reset as seconds remaining; an epoch-style value is read as
+    an absolute time. Capped so an unexpected header can't park the job for hours."""
+    if reset_header and reset_header.isdigit():
+        value = int(reset_header)
+        seconds = value - int(time.time()) if value > 10**9 else value
+        return max(1, min(seconds + 1, MAX_RATE_LIMIT_WAIT_SECONDS))
+    return min(5 * attempt, MAX_RATE_LIMIT_WAIT_SECONDS)
 
 
 class OwletHistoryClient:
     """Reads Owlet's vital-data and sleep-data services for one account's first baby profile."""
 
     def __init__(
-        self, region: str, refresh_token: str, *, fetch: Fetch | None = None, timezone: str = "UTC"
+        self,
+        region: str,
+        refresh_token: str,
+        *,
+        fetch: Fetch | None = None,
+        sleep: Sleep = asyncio.sleep,
+        timezone: str = "UTC",
     ):
         if region not in REGION_INFO:
             raise ValueError(f"unknown Owlet region {region!r}")
@@ -190,6 +203,7 @@ class OwletHistoryClient:
         self._suffix = ".eu" if region == "europe" else ""
         self._timezone = timezone
         self._fetch = fetch or self._http_fetch
+        self._sleep = sleep
         self._session: aiohttp.ClientSession | None = None
         self._id_token: str | None = None
         self._profile_path: str | None = None
@@ -240,10 +254,10 @@ class OwletHistoryClient:
                 f"https://accounts{self._suffix}.owletdata.com/v2/accounts/{account_id}/profiles"
             )
             profiles = (payload or {}).get("profiles") or []
-            if not profiles:
-                raise OwletHistoryError("no baby profile on this Owlet account")
-            # name is "accounts/<account>/profiles/<profile>", which is also the history path
-            self._profile_path = f"/v1/{profiles[0]['name']}"
+            name = str(profiles[0].get("name") or "") if profiles else ""
+            if not name.startswith("accounts/"):
+                raise OwletHistoryError("no usable baby profile on this Owlet account")
+            self._profile_path = f"/v1/{name}"  # accounts/<id>/profiles/<id>, as the APIs use
         return self._profile_path
 
     async def _get(self, url: str) -> Any:
@@ -260,8 +274,10 @@ class OwletHistoryClient:
         """JSON over aiohttp, waiting out rate limits (429) and retrying 5xx."""
         if self._session is None:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
-        host = urllib.parse.urlsplit(url).netloc  # errors name the host only, never account ids
-        for attempt in range(1, attempts + 1):
+        host = urllib.parse.urlsplit(url).netloc  # error messages name the host only
+        attempt = 0
+        while True:
+            attempt += 1
             async with self._session.request(method, url, headers=headers, data=form) as response:
                 if response.status < 400:
                     return await response.json(content_type=None)
@@ -270,9 +286,9 @@ class OwletHistoryClient:
                 reset = response.headers.get("x-ratelimit-reset") or response.headers.get(
                     "Retry-After"
                 )
-                wait = int(reset) + 1 if reset and reset.isdigit() else 5 * attempt
-            await asyncio.sleep(wait)
-        raise OwletHistoryError(f"{host} kept failing")  # unreachable; keeps type checkers calm
+                wait = _retry_wait(reset, attempt)
+            logger.warning("%s answered HTTP %s; retrying in %s s", host, response.status, wait)
+            await self._sleep(wait)
 
 
 async def _default_pause() -> None:
@@ -302,12 +318,23 @@ async def backfill_account(
     minutes = history_minutes(vitals, sleep)
     if not minutes:
         return 0
-    margin = timedelta(seconds=LIVE_GAP_SECONDS)
-    live = await store.live_reading_epochs(
+    margin = timedelta(seconds=MINUTE)
+    live = await store.live_reading_minutes(
         account_id, device_serial, minutes[0].recorded_at - margin, minutes[-1].recorded_at + margin
     )
     return await store.upsert_history_minutes(
         account_id, device_serial, without_live(minutes, live)
+    )
+
+
+async def _record_completed(store: ReadingStore, account_id: int, days: int, written: int) -> None:
+    await store.set_history_backfill_state(
+        account_id,
+        {
+            "completed_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "days": days,
+            "minutes": written,
+        },
     )
 
 
@@ -341,8 +368,8 @@ class HistoryBackfill:
         token, serial = self.refresh_token(), self.device_serial()
         if not token or not serial:
             return 0
-        has_history = await self.store.has_history_minutes(self.account_id)
-        days = self.recent_days if has_history else self.initial_days
+        completed_before = await self.store.history_backfill_state(self.account_id)
+        days = self.recent_days if completed_before else self.initial_days
         client = self.client_factory(self.region, token)
         try:
             written = await backfill_account(
@@ -350,6 +377,7 @@ class HistoryBackfill:
             )
         finally:
             await client.close()
+        await _record_completed(self.store, self.account_id, days, written)
         logger.info(
             "history backfill account_id=%s days=%s minutes=%s", self.account_id, days, written
         )
@@ -365,16 +393,26 @@ async def main(argv: list[str] | None = None) -> int:
         "--days", type=int, help="how many days back (default: HISTORY_BACKFILL_DAYS)"
     )
     parser.add_argument(
-        "--remove", action="store_true", help="delete all backfilled history, then exit"
+        "--remove", action="store_true", help="delete backfilled history instead, then exit"
     )
+    parser.add_argument("--account", type=int, help="only this dashboard account id")
     args = parser.parse_args(argv)
     settings = Settings()
     store = ReadingStore(settings.database_path)
+    accounts = [
+        account
+        for account in await store.list_accounts()
+        if args.account is None or int(account["id"]) == args.account
+    ]
     if args.remove:
-        print(f"Removed {await store.delete_history_minutes()} backfilled minutes.")
+        removed = 0
+        for account in accounts:
+            removed += await store.delete_history_minutes(int(account["id"]))
+            await store.set_history_backfill_state(int(account["id"]), None)
+        print(f"Removed {removed} backfilled minutes.")
         return 0
     days = args.days or settings.history_backfill_days
-    for account in await store.list_accounts():
+    for account in accounts:
         account_id = int(account["id"])
         if account.get("status") != "active" or not account.get("refresh_token"):
             continue
@@ -389,6 +427,7 @@ async def main(argv: list[str] | None = None) -> int:
             written = await backfill_account(store, account_id, serial, client, days=days)
         finally:
             await client.close()
+        await _record_completed(store, account_id, days, written)
         print(f"account {account_id}: {written} minutes added or refreshed ({days} days)")
     return 0
 

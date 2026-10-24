@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -82,6 +81,7 @@ class Poller:
         history: HistoryJob | None = None,
         history_interval_seconds: float = 24 * 3600,
         history_initial_delay_seconds: float = 60,
+        history_retry_seconds: float = 3600,
     ):
         self.store = store
         self.read_once = read_once
@@ -91,6 +91,7 @@ class Poller:
         self.history = history
         self.history_interval_seconds = history_interval_seconds
         self.history_initial_delay_seconds = history_initial_delay_seconds
+        self.history_retry_seconds = history_retry_seconds
         self._task: asyncio.Task[None] | None = None
         self._history_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -103,8 +104,7 @@ class Poller:
             self._stop.clear()
             self._task = asyncio.create_task(self._run(), name="owlet-poller")
         if self.history is not None and (self._history_task is None or self._history_task.done()):
-            # Its own task: a backfill takes a minute of paced requests and must not
-            # delay live polling.
+            # separate task, so a slow backfill never delays live polling
             self._history_task = asyncio.create_task(
                 self._run_history(), name="owlet-history-backfill"
             )
@@ -116,12 +116,14 @@ class Poller:
         move on. The task is already cancelled and its account disconnected, so
         it does nothing further even if it outlives this await."""
         self._stop.set()
-        if self._history_task:
-            self._history_task.cancel()
-        if self._task:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.shield(self._task), timeout=drain_timeout)
+        tasks = [task for task in (self._task, self._history_task) if task]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            done, _pending = await asyncio.wait(tasks, timeout=drain_timeout)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()  # retrieve it, so asyncio doesn't warn at shutdown
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -151,17 +153,18 @@ class Poller:
             await asyncio.sleep(self.interval_seconds)
 
     async def _run_history(self) -> None:
-        """Backfill from Owlet's history services shortly after start, then on an interval,
-        so time this collector was down (sleeping PC, outage) gets 10-minute averages."""
+        """Backfill shortly after start, then on an interval (sooner after a failure)."""
         await asyncio.sleep(self.history_initial_delay_seconds)
         while not self._stop.is_set():
+            delay = self.history_interval_seconds
             try:
                 await self.history.run_once()  # type: ignore[union-attr]
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Owlet history backfill failed; will retry")
-            await asyncio.sleep(self.history_interval_seconds)
+                delay = min(delay, self.history_retry_seconds)
+                logger.exception("Owlet history backfill failed; retrying in %.0f s", delay)
+            await asyncio.sleep(delay)
 
     async def _check_custom_alert(self, reading: OwletReading) -> None:
         """User-configurable low-O2 alert: crossing below the account's chosen
@@ -326,8 +329,8 @@ class Poller:
 def history_for_client(
     store: ReadingStore, account_id: int, region: str, client: OwletClient, days: int
 ) -> HistoryBackfill | None:
-    """The account's history job, reading the client's live refresh token and sock serial
-    (both can change after start); None when backfill is off (days == 0)."""
+    """The account's history job, or None when backfill is off. The token and serial are
+    read lazily because both can change after start."""
     if days <= 0:
         return None
     return HistoryBackfill(
